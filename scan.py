@@ -21,13 +21,18 @@ GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 TO_EMAIL = os.environ["TO_EMAIL"]
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
-SCAN_PROMPT = """You are a government signal investing analyst. You have up to 10 web searches — use them efficiently (1-2 per source, 1-2 for news/fundamentals cross-checks).
+def _build_scan_prompt() -> str:
+    today = datetime.now().strftime("%B %-d, %Y")
+    cutoff = (datetime.now() - __import__("datetime").timedelta(days=30)).strftime("%B %-d, %Y")
+    return f"""You are a government signal investing analyst. Today is {today}. You have up to 10 web searches — use them efficiently (1-2 per source, 1-2 for news/fundamentals cross-checks).
 
-Search these public sources for congressional trading activity from the past 45 days:
+Search these public sources for congressional trading activity filed or reported on or after {cutoff} (last 30 days only):
 - Quiver Quant congressional trading (quiverquant.com/congresstrading)
 - Capitol Trades (capitoltrades.com)
 - Unusual Whales political trades (unusualwhales.com/political_trades)
 - SEC EDGAR Form 4 filings for recent insider transactions
+
+IMPORTANT: Exclude any trade with a purchase_date earlier than {cutoff}. Trades from the past 7 days are strongly preferred — the fresher the trade, the more actionable. If you find no trades in the past 30 days, say so rather than returning older ones.
 
 For each trade candidate, analyze:
 1. Congressional trade details: member name, party, chamber, committee memberships
@@ -39,13 +44,16 @@ For each trade candidate, analyze:
 7. News alignment: supporting/contradicting news from past 2 weeks
 
 Score each 0–100 across 5 components:
-- Congressional Signal Quality (max 25 pts)
+- Congressional Signal Quality (max 25 pts) — award full points only for trades filed within the past 14 days; deduct 5 pts for each additional week of age
 - Related Persons Activity (max 15 pts)
 - Fundamentals (max 25 pts)
 - Upcoming Catalysts (max 20 pts)
 - News Alignment (max 15 pts)
 
-When you are done searching, output ONLY a JSON array of the top 5 opportunities — no other text, no markdown fences. If you approach your search limit, stop searching and output what you have.
+When you are done searching, output ONLY a JSON array of the top 5 opportunities — no other text, no markdown fences. If you approach your search limit, stop searching and output what you have."""
+
+
+SCAN_PROMPT = _build_scan_prompt()
 
 [
   {
@@ -72,7 +80,7 @@ When you are done searching, output ONLY a JSON array of the top 5 opportunities
 
 def call_claude(client: anthropic.Anthropic) -> str:
     """Call Claude with web search. Single call — prompt instructs Claude to finish within search budget."""
-    messages = [{"role": "user", "content": SCAN_PROMPT}]
+    messages = [{"role": "user", "content": _build_scan_prompt()}]
     tools = [{"type": "web_search_20260209", "name": "web_search"}]
 
     response = client.messages.create(
