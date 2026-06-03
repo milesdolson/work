@@ -21,9 +21,9 @@ GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 TO_EMAIL = os.environ["TO_EMAIL"]
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
-SCAN_PROMPT = """You are a government signal investing analyst. Using your web search tool, scan the following public sources for congressional trading activity from the past 45 days:
+SCAN_PROMPT = """You are a government signal investing analyst. You have up to 10 web searches — use them efficiently (1-2 per source, 1-2 for news/fundamentals cross-checks).
 
-Search these sources:
+Search these public sources for congressional trading activity from the past 45 days:
 - Quiver Quant congressional trading (quiverquant.com/congresstrading)
 - Capitol Trades (capitoltrades.com)
 - Unusual Whales political trades (unusualwhales.com/political_trades)
@@ -45,7 +45,8 @@ Score each 0–100 across 5 components:
 - Upcoming Catalysts (max 20 pts)
 - News Alignment (max 15 pts)
 
-Return ONLY a JSON array of the top 5 opportunities — no other text, no markdown fences:
+When you are done searching, output ONLY a JSON array of the top 5 opportunities — no other text, no markdown fences. If you approach your search limit, stop searching and output what you have.
+
 [
   {
     "rank": 1,
@@ -70,30 +71,24 @@ Return ONLY a JSON array of the top 5 opportunities — no other text, no markdo
 
 
 def call_claude(client: anthropic.Anthropic) -> str:
-    """Call Claude with web search, handling pause_turn continuations."""
+    """Call Claude with web search. Single call — prompt instructs Claude to finish within search budget."""
     messages = [{"role": "user", "content": SCAN_PROMPT}]
     tools = [{"type": "web_search_20260209", "name": "web_search"}]
 
-    for _ in range(6):
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=8096,
-            tools=tools,
-            messages=messages,
-        )
-        if response.stop_reason == "pause_turn":
-            messages = [
-                {"role": "user", "content": SCAN_PROMPT},
-                {"role": "assistant", "content": response.content},
-            ]
-            continue
-        text_blocks = [
-            b.text for b in response.content
-            if hasattr(b, "text") and b.type == "text"
-        ]
-        return "\n".join(text_blocks).strip()
-
-    raise RuntimeError("Scan did not complete after maximum continuation attempts")
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=8096,
+        tools=tools,
+        messages=messages,
+    )
+    text_blocks = [
+        b.text for b in response.content
+        if hasattr(b, "text") and b.type == "text"
+    ]
+    result = "\n".join(text_blocks).strip()
+    if not result:
+        raise RuntimeError(f"Claude returned no text (stop_reason={response.stop_reason})")
+    return result
 
 
 def extract_json(text: str) -> list:
