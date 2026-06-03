@@ -24,7 +24,7 @@ MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 def _build_scan_prompt() -> str:
     today = datetime.now().strftime("%B %-d, %Y")
     cutoff = (datetime.now() - __import__("datetime").timedelta(days=30)).strftime("%B %-d, %Y")
-    return f"""You are a government signal investing analyst. Today is {today}. You have up to 10 web searches — use them efficiently (1-2 per source, 1-2 for news/fundamentals cross-checks).
+    return f"""You are a government signal investing analyst. Today is {today}. You have up to 10 web searches - use them efficiently (1-2 per source, 1-2 for news/fundamentals cross-checks).
 
 Search these public sources for congressional trading activity filed or reported on or after {cutoff} (last 30 days only):
 - Quiver Quant congressional trading (quiverquant.com/congresstrading)
@@ -32,7 +32,7 @@ Search these public sources for congressional trading activity filed or reported
 - Unusual Whales political trades (unusualwhales.com/political_trades)
 - SEC EDGAR Form 4 filings for recent insider transactions
 
-IMPORTANT: Exclude any trade with a purchase_date earlier than {cutoff}. Trades from the past 7 days are strongly preferred — the fresher the trade, the more actionable. If you find no trades in the past 30 days, say so rather than returning older ones.
+IMPORTANT: Exclude any trade with a purchase_date earlier than {cutoff}. Trades from the past 7 days are strongly preferred - the fresher the trade, the more actionable. If you find no trades in the past 30 days, say so rather than returning older ones.
 
 For each trade candidate, analyze:
 1. Congressional trade details: member name, party, chamber, committee memberships
@@ -44,42 +44,39 @@ For each trade candidate, analyze:
 7. News alignment: supporting/contradicting news from past 2 weeks
 
 Score each 0–100 across 5 components:
-- Congressional Signal Quality (max 25 pts) — award full points only for trades filed within the past 14 days; deduct 5 pts for each additional week of age
+- Congressional Signal Quality (max 25 pts) - award full points only for trades filed within the past 14 days; deduct 5 pts for each additional week of age
 - Related Persons Activity (max 15 pts)
 - Fundamentals (max 25 pts)
 - Upcoming Catalysts (max 20 pts)
 - News Alignment (max 15 pts)
 
-When you are done searching, output ONLY a JSON array of the top 5 opportunities — no other text, no markdown fences. If you approach your search limit, stop searching and output what you have."""
-
-
-SCAN_PROMPT = _build_scan_prompt()
+When you are done searching, output ONLY a JSON array of the top 5 opportunities - no other text, no markdown fences. If you approach your search limit, stop searching and output what you have.
 
 [
-  {
+  {{
     "rank": 1,
     "ticker": "AAPL",
     "company_name": "Apple Inc.",
     "total_score": 82,
-    "component_scores": {
+    "component_scores": {{
       "congressional_signal": 21,
       "related_persons": 11,
       "fundamentals": 22,
       "upcoming_catalysts": 16,
       "news_alignment": 12
-    },
+    }},
     "legislator_name": "Rep. Jane Smith (D-CA)",
     "purchase_date": "2026-05-20",
-    "trade_size": "$50,001 – $100,000",
+    "trade_size": "$50,001 - $100,000",
     "committee": "House Energy & Commerce",
     "insider_proximity_rating": "High",
     "explanation": "2-3 sentence explanation."
-  }
+  }}
 ]"""
 
 
 def call_claude(client: anthropic.Anthropic) -> str:
-    """Call Claude with web search. Single call — prompt instructs Claude to finish within search budget."""
+    """Call Claude with web search. Single call - prompt instructs Claude to finish within search budget."""
     messages = [{"role": "user", "content": _build_scan_prompt()}]
     tools = [{"type": "web_search_20260209", "name": "web_search"}]
 
@@ -259,7 +256,7 @@ def build_error_html(error_msg: str, scan_date: str) -> str:
   <div style="max-width:600px;margin:0 auto;padding:16px;">
     <div style="background:#991b1b;border-radius:10px 10px 0 0;padding:18px 20px;">
       <div style="color:#ffffff;font-size:18px;font-weight:700;font-family:Arial,sans-serif;">
-        Investment Briefing — Scan Failed
+        Investment Briefing - Scan Failed
       </div>
       <div style="color:#fca5a5;font-size:13px;font-family:Arial,sans-serif;margin-top:4px;">
         {html.escape(scan_date)}
@@ -295,14 +292,14 @@ def run_scan() -> None:
         raw = call_claude(client)
         opportunities = extract_json(raw)
         html_body = build_email_html(opportunities, scan_date)
-        send_email(f"Investment Briefing — {scan_date}", html_body)
+        send_email(f"Investment Briefing - {scan_date}", html_body)
         print(f"Briefing sent for {scan_date}")
     except Exception:
         error_detail = traceback.format_exc()
         print(error_detail)
         try:
             html_body = build_error_html(error_detail[:3000], scan_date)
-            send_email(f"Investment Briefing FAILED — {scan_date}", html_body)
+            send_email(f"Investment Briefing FAILED - {scan_date}", html_body)
             print("Error notification email sent.")
         except Exception as mail_err:
             print(f"Could not send error email: {mail_err}")
