@@ -313,12 +313,20 @@ def load_congressional_trades(backtest_start="2023-01-01", backtest_end="2024-12
     combined["filing_date"] = combined["filing_date"].apply(_parse_date)
     combined["ticker"] = combined["ticker"].apply(_clean_ticker)
 
+    after_parse = len(combined)
+    print(f"  DEBUG after_parse: {after_parse}, filing_date sample: {combined['filing_date'].dropna().head(3).tolist()}")
+    print(f"  DEBUG transaction_type values: {combined['transaction_type'].value_counts().head(5).to_dict()}")
+    print(f"  DEBUG ticker nulls: {combined['ticker'].isna().sum()} / {len(combined)}")
+    print(f"  DEBUG filing_date nulls: {combined['filing_date'].isna().sum()} / {len(combined)}")
+
     # Filter: buys only, valid ticker, valid date
     combined = combined.dropna(subset=["filing_date", "ticker"])
+    print(f"  DEBUG after dropna: {len(combined)}")
     buy_mask = combined["transaction_type"].fillna("").str.lower().str.contains(
         "purchase|buy|bought", na=False
     )
     combined = combined[buy_mask]
+    print(f"  DEBUG after buy_mask: {len(combined)}")
 
     # Restrict to backtest window
     combined = combined[
