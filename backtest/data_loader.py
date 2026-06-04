@@ -389,7 +389,7 @@ def _load_senate_efdsearch(start: str = "2023-01-01", end: str = "2024-12-31") -
                     v = cells[j]
                     if "ticker" in h:
                         rec["ticker"] = v
-                    elif "transaction" in h and "type" in h:
+                    elif ("transaction" in h and "type" in h) or h == "type":
                         rec["type"] = v
                     elif "date" in h and "transaction" in h:
                         rec["transaction_date"] = v
@@ -405,6 +405,42 @@ def _load_senate_efdsearch(start: str = "2023-01-01", end: str = "2024-12-31") -
 
     print(f"  senate efdsearch: {len(all_records)} transaction records collected")
     return pd.DataFrame(all_records) if all_records else pd.DataFrame()
+
+
+def _parse_ptr_html_tables(soup, ptr: dict, all_records: list) -> None:
+    """Extract transaction rows from a parsed House PTR HTML page."""
+    for table in soup.find_all("table"):
+        headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+        if not any(kw in h for h in headers for kw in ("transaction", "ticker", "asset")):
+            continue
+        for row in table.find_all("tr")[1:]:
+            cells = [td.get_text(strip=True) for td in row.find_all("td")]
+            if len(cells) < 4:
+                continue
+            rec = {
+                "legislator": ptr["legislator"],
+                "filing_date": ptr["filing_date"],
+                "state": ptr["state"],
+                "chamber": "house",
+            }
+            for j, h in enumerate(headers):
+                if j < len(cells):
+                    if "ticker" in h:
+                        rec["ticker"] = cells[j]
+                    elif "transaction" in h and "type" in h:
+                        rec["transaction_type"] = cells[j]
+                    elif "date" in h and "transaction" in h:
+                        rec["transaction_date"] = cells[j]
+                    elif "date" in h and "notif" in h:
+                        rec["filing_date"] = cells[j]
+                    elif "amount" in h:
+                        rec["amount"] = cells[j]
+                    elif "owner" in h:
+                        rec["owner"] = cells[j]
+                    elif "asset" in h or "description" in h:
+                        rec["asset_description"] = cells[j]
+            if rec.get("ticker") or rec.get("asset_description"):
+                all_records.append(rec)
 
 
 def _load_house_clerk(start_year: int = 2023, end_year: int = 2024) -> pd.DataFrame:
@@ -471,53 +507,79 @@ def _load_house_clerk(start_year: int = 2023, end_year: int = 2024) -> pd.DataFr
 
         print(f"  house clerk: {year} has {len(ptr_filings)} PTR filings, fetching transaction details...")
 
-        # Fetch individual PTR HTML reports (rate-limited)
+        # Fetch individual PTR reports — try .htm first, fall back to .pdf
+        _pdf_warned = False
         for i, ptr in enumerate(ptr_filings):
             if i % 50 == 0 and i > 0:
                 print(f"    ... {i}/{len(ptr_filings)} PTRs fetched")
             doc_id = ptr["doc_id"]
-            htm_url = f"https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/{year}/{doc_id}.htm"
-            try:
-                r2 = requests.get(htm_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-                r2.raise_for_status()
-                soup = BeautifulSoup(r2.text, "html.parser")
-            except Exception:
+            base = f"https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/{year}/{doc_id}"
+
+            resp_bytes = None
+            for ext in (".htm", ".pdf"):
+                try:
+                    r2 = requests.get(base + ext, timeout=30,
+                                      headers={"User-Agent": "Mozilla/5.0"})
+                    r2.raise_for_status()
+                    resp_bytes = r2.content
+                    break
+                except Exception:
+                    continue
+
+            if resp_bytes is None:
                 continue
 
-            # Parse transaction table rows
-            for table in soup.find_all("table"):
-                headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
-                if not any(h in headers for h in ("transaction", "ticker", "asset")):
-                    continue
-                for row in table.find_all("tr")[1:]:
-                    cells = [td.get_text(strip=True) for td in row.find_all("td")]
-                    if len(cells) < 4:
-                        continue
-                    # Map cells to fields by header position when available
-                    rec = {
-                        "legislator": ptr["legislator"],
-                        "filing_date": ptr["filing_date"],
-                        "state": ptr["state"],
-                        "chamber": "house",
-                    }
-                    for j, h in enumerate(headers):
-                        if j < len(cells):
-                            if "ticker" in h:
-                                rec["ticker"] = cells[j]
-                            elif "transaction" in h and "type" in h:
-                                rec["transaction_type"] = cells[j]
-                            elif "date" in h and "transaction" in h:
-                                rec["transaction_date"] = cells[j]
-                            elif "date" in h and "notif" in h:
-                                rec["filing_date"] = cells[j]
-                            elif "amount" in h:
-                                rec["amount"] = cells[j]
-                            elif "owner" in h:
-                                rec["owner"] = cells[j]
-                            elif "asset" in h or "description" in h:
-                                rec["asset_description"] = cells[j]
-                    if rec.get("ticker") or rec.get("asset_description"):
-                        all_records.append(rec)
+            # Detect HTML vs PDF by content sniffing
+            sniff = resp_bytes.lstrip()[:8].lower()
+            if sniff.startswith(b"<!") or sniff.startswith(b"<html") or b"<table" in resp_bytes[:4096].lower():
+                soup = BeautifulSoup(resp_bytes, "html.parser")
+                _parse_ptr_html_tables(soup, ptr, all_records)
+            else:
+                # Binary PDF — use pdfplumber when available
+                try:
+                    import pdfplumber
+                    with pdfplumber.open(io.BytesIO(resp_bytes)) as pdf:
+                        for page in pdf.pages:
+                            for raw_table in (page.extract_tables() or []):
+                                if not raw_table or len(raw_table) < 2:
+                                    continue
+                                hdrs = [str(c).lower().strip() if c else "" for c in raw_table[0]]
+                                if not any(kw in h for h in hdrs
+                                           for kw in ("transaction", "ticker", "asset")):
+                                    continue
+                                for row in raw_table[1:]:
+                                    cells = [str(c).strip() if c else "" for c in row]
+                                    if len(cells) < 4:
+                                        continue
+                                    rec = {
+                                        "legislator": ptr["legislator"],
+                                        "filing_date": ptr["filing_date"],
+                                        "state": ptr["state"],
+                                        "chamber": "house",
+                                    }
+                                    for j, h in enumerate(hdrs):
+                                        if j < len(cells):
+                                            if "ticker" in h:
+                                                rec["ticker"] = cells[j]
+                                            elif "transaction" in h and "type" in h:
+                                                rec["transaction_type"] = cells[j]
+                                            elif "date" in h and "transaction" in h:
+                                                rec["transaction_date"] = cells[j]
+                                            elif "date" in h and "notif" in h:
+                                                rec["filing_date"] = cells[j]
+                                            elif "amount" in h:
+                                                rec["amount"] = cells[j]
+                                            elif "owner" in h:
+                                                rec["owner"] = cells[j]
+                                            elif "asset" in h or "description" in h:
+                                                rec["asset_description"] = cells[j]
+                                    if rec.get("ticker") or rec.get("asset_description"):
+                                        all_records.append(rec)
+                except ImportError:
+                    if not _pdf_warned:
+                        print("  house clerk: PDF PTRs found but pdfplumber not installed "
+                              "(pip install pdfplumber); skipping PDF filings")
+                        _pdf_warned = True
             time.sleep(0.1)  # be polite to the server
 
     if not all_records:
