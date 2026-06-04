@@ -39,9 +39,13 @@ HOUSE_URLS = [
     "https://raw.githubusercontent.com/leftmove/wallstreetlocal/main/apps/server/data/house.csv",
     "https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json",
     "https://raw.githubusercontent.com/jermwatt/house-stock-watcher/main/data/all_transactions.json",
+    "https://raw.githubusercontent.com/timothycarambat/house-stock-watcher-data/master/aggregate/all_transactions.json",
 ]
 SENATE_URLS = [
+    # GitHub-hosted aggregate file - most reliable free source
+    "https://raw.githubusercontent.com/timothycarambat/senate-stock-watcher-data/master/aggregate/all_transactions.json",
     "https://raw.githubusercontent.com/leftmove/wallstreetlocal/main/apps/server/data/senate.csv",
+    "https://senate-stock-watcher-data.s3-us-west-2.amazonaws.com/aggregate/all_transactions.json",
     "https://senate-stock-watcher-data.s3.amazonaws.com/daily/all_transactions.json",
     "https://raw.githubusercontent.com/jermwatt/senate-stock-watcher/main/data/all_transactions.json",
 ]
@@ -285,6 +289,18 @@ def load_congressional_trades(backtest_start="2023-01-01", backtest_end="2024-12
             print(f"  WARNING: could not load {chamber} data from any source")
             continue
         df = _normalize_columns(df, chamber)
+        # Parse filing and transaction dates up front so fallback works.
+        df["filing_date"] = df["filing_date"].apply(_parse_date)
+        if "transaction_date" in df.columns:
+            df["transaction_date"] = df["transaction_date"].apply(_parse_date)
+        # If source has no filing_date (e.g. senate-stock-watcher only has
+        # transaction_date), use transaction_date + 30 days as a proxy to
+        # approximate the STOCK Act disclosure lag.
+        if df["filing_date"].isna().all() and "transaction_date" in df.columns:
+            df["filing_date"] = df["transaction_date"].apply(
+                lambda d: d + pd.Timedelta(days=30) if pd.notna(d) else None
+            )
+            print(f"  {chamber}: filing_date not in source; using transaction_date + 30d as proxy")
         frames.append(df)
 
     if not frames:
