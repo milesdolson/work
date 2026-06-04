@@ -251,47 +251,160 @@ def _try_sources(urls: list[str], chamber: str, cache_path: Path) -> Optional[pd
     return None
 
 
-def _load_senate_efts(start: str = "2023-01-01", end: str = "2024-12-31") -> pd.DataFrame:
+def _load_senate_efdsearch(start: str = "2023-01-01", end: str = "2024-12-31") -> pd.DataFrame:
     """
-    Load Senate PTR transactions from the official EFTS search API with pagination.
-    Returns raw DataFrame; caller normalizes column names.
+    Load Senate PTR transactions from the official efdsearch.senate.gov API.
+    1. GET home page -> extract CSRF token, agree to terms
+    2. POST to /search/report/data/ -> paginated list of PTR documents
+    3. For each PTR, fetch the view page and parse the transaction table
     """
-    records = []
-    max_pages = 200  # cap at 2000 records
-    consecutive_errors = 0
-
-    while len(records) < max_pages * 10:
-        try:
-            url = (
-                "https://efts.senate.gov/LATEST/search.json"
-                f"?q=%22stock%22&dateRange=custom&fromDate={start}&toDate={end}"
-                f"&from={len(records)}&size=10"
-            )
-            resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-            resp.raise_for_status()
-            data = resp.json()
-            hits = data.get("hits", {}).get("hits", [])
-            if not hits:
-                break
-            for hit in hits:
-                src = hit.get("_source", {})
-                records.append(src)
-            consecutive_errors = 0
-            if len(hits) < 10:
-                break  # last page
-        except Exception as exc:
-            consecutive_errors += 1
-            if consecutive_errors >= 3:
-                print(f"  senate EFTS: stopping after {consecutive_errors} errors: {exc}")
-                break
-
-    if not records:
+    try:
+        from bs4 import BeautifulSoup
+        import re as _re
+    except ImportError:
+        print("  senate efdsearch: beautifulsoup4 not available")
         return pd.DataFrame()
 
-    df = pd.DataFrame(records)
-    # Debug: show field names on first call so we can fix normalization if needed
-    print(f"  senate EFTS: {len(df)} raw records; columns: {list(df.columns)[:12]}")
-    return df
+    BASE = "https://efdsearch.senate.gov"
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    # Step 1: get CSRF token from home page + agree to prohibition
+    try:
+        r = session.get(f"{BASE}/search/home/", timeout=20)
+        r.raise_for_status()
+        soup0 = BeautifulSoup(r.text, "html.parser")
+        csrf_input = soup0.find("input", {"name": "csrfmiddlewaretoken"})
+        csrf = csrf_input["value"] if csrf_input else session.cookies.get("csrftoken", "")
+        # Accept the prohibition agreement (required by the site)
+        session.post(
+            f"{BASE}/search/home/",
+            data={"csrfmiddlewaretoken": csrf, "prohibition_agreement": "1"},
+            headers={"Referer": f"{BASE}/search/home/",
+                     "Content-Type": "application/x-www-form-urlencoded"},
+            timeout=20,
+        )
+        csrf = session.cookies.get("csrftoken", csrf)
+    except Exception as exc:
+        print(f"  senate efdsearch: can't reach home page: {exc}")
+        return pd.DataFrame()
+
+    # Format dates as MM/DD/YYYY HH:MM:SS
+    from datetime import datetime as _dt
+    from_dt = _dt.strptime(start, "%Y-%m-%d").strftime("%m/%d/%Y 00:00:00")
+    to_dt = _dt.strptime(end, "%Y-%m-%d").strftime("%m/%d/%Y 23:59:59")
+
+    # Step 2: paginate through all PTR documents in the window
+    ptr_docs = []  # list of (senator_name, filing_date, view_url)
+    offset = 0
+    while True:
+        try:
+            resp = session.post(
+                f"{BASE}/search/report/data/",
+                data={
+                    "csrfmiddlewaretoken": csrf,
+                    "report_types": "[11]",  # 11 = Periodic Transaction Report
+                    "filer_types": "[]",
+                    "submitted_start_date": from_dt,
+                    "submitted_end_date": to_dt,
+                    "candidate_state": "",
+                    "senator_state": "",
+                    "office_id": "",
+                    "first_name": "",
+                    "last_name": "",
+                    "start": str(offset),
+                    "length": "100",
+                    "draw": "2",
+                },
+                headers={
+                    "Referer": f"{BASE}/search/home/",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            print(f"  senate efdsearch: search page error at offset {offset}: {exc}")
+            break
+
+        rows = payload.get("data", [])
+        if not rows:
+            break
+
+        for row in rows:
+            # row is [first_name, last_name, office?, link_html, date_received]
+            try:
+                first = str(row[0]).strip() if len(row) > 0 else ""
+                last = str(row[1]).strip() if len(row) > 1 else ""
+                # link is usually the 4th element (index 3) as HTML with <a href=...>
+                link_html = str(row[3]) if len(row) > 3 else ""
+                date_rcv = str(row[4]).strip() if len(row) > 4 else ""
+                href_m = _re.search(r'href=["\']([^"\']+)["\']', link_html)
+                if not href_m:
+                    continue
+                href = href_m.group(1)
+                view_url = href if href.startswith("http") else BASE + href
+                ptr_docs.append((f"{first} {last}".strip(), date_rcv, view_url))
+            except Exception:
+                continue
+
+        total = payload.get("recordsTotal", 0)
+        offset += len(rows)
+        if offset >= total or not rows:
+            break
+
+    print(f"  senate efdsearch: found {len(ptr_docs)} PTR documents; fetching transactions...")
+
+    # Step 3: fetch each PTR view page and parse the transaction table
+    all_records = []
+    for i, (senator, filing_date, url) in enumerate(ptr_docs):
+        if i % 100 == 0 and i > 0:
+            print(f"    ... {i}/{len(ptr_docs)} PTRs parsed ({len(all_records)} transactions so far)")
+        try:
+            r = session.get(url, timeout=20)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+        except Exception:
+            continue
+
+        for table in soup.find_all("table"):
+            headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+            if not any(h in headers for h in ("ticker", "transaction", "asset")):
+                continue
+            for row in table.find_all("tr")[1:]:
+                cells = [td.get_text(strip=True) for td in row.find_all("td")]
+                if len(cells) < 4:
+                    continue
+                rec = {"senator": senator, "filing_date": filing_date, "chamber": "senate"}
+                for j, h in enumerate(headers):
+                    if j >= len(cells):
+                        continue
+                    v = cells[j]
+                    if "ticker" in h:
+                        rec["ticker"] = v
+                    elif "transaction" in h and "type" in h:
+                        rec["type"] = v
+                    elif "date" in h and "transaction" in h:
+                        rec["transaction_date"] = v
+                    elif "amount" in h:
+                        rec["amount"] = v
+                    elif "owner" in h:
+                        rec["owner"] = v
+                    elif "asset" in h or "description" in h:
+                        rec["asset_description"] = v
+                if rec.get("type") or rec.get("ticker"):
+                    all_records.append(rec)
+        time.sleep(0.05)
+
+    print(f"  senate efdsearch: {len(all_records)} transaction records collected")
+    return pd.DataFrame(all_records) if all_records else pd.DataFrame()
 
 
 def _load_house_clerk(start_year: int = 2023, end_year: int = 2024) -> pd.DataFrame:
@@ -331,17 +444,22 @@ def _load_house_clerk(start_year: int = 2023, end_year: int = 2024) -> pd.DataFr
             print(f"  house clerk: {year} XML parse failed: {exc}")
             continue
 
+        # Debug: show what element names are in the XML
+        child_tags = {c.tag for child in root for c in child} | {c.tag for c in root}
+        print(f"  house clerk: {year} XML root='{root.tag}' child tags={list(child_tags)[:8]}")
+
         # Find PTR filings (FilingType == "P")
+        # House Clerk XML uses <Member> elements (not <Filing>)
         ptr_filings = []
-        for filing in root.iter("Filing"):
-            ft = (filing.findtext("FilingType") or "").strip().upper()
+        for member in root.iter("Member"):
+            ft = (member.findtext("FilingType") or "").strip().upper()
             if ft != "P":
                 continue
-            doc_id = (filing.findtext("DocID") or "").strip()
-            first = (filing.findtext("First") or filing.findtext("FirstName") or "").strip()
-            last = (filing.findtext("Last") or filing.findtext("LastName") or "").strip()
-            filing_date = (filing.findtext("FilingDate") or "").strip()
-            state_dst = (filing.findtext("StateDst") or "").strip()
+            doc_id = (member.findtext("DocID") or member.findtext("ID") or "").strip()
+            first = (member.findtext("First") or member.findtext("FirstName") or "").strip()
+            last = (member.findtext("Last") or member.findtext("LastName") or "").strip()
+            filing_date = (member.findtext("FilingDate") or "").strip()
+            state_dst = (member.findtext("StateDst") or "").strip()
             if doc_id:
                 ptr_filings.append({
                     "doc_id": doc_id,
@@ -455,7 +573,7 @@ def load_congressional_trades(backtest_start="2023-01-01", backtest_end="2024-12
     if not _has_window_coverage(senate_df, backtest_start, backtest_end):
         print(f"  senate: cached data has no {backtest_start[:4]}-{backtest_end[:4]} records; "
               f"trying official efts.senate.gov ...")
-        efts_raw = _load_senate_efts(backtest_start, backtest_end)
+        efts_raw = _load_senate_efdsearch(backtest_start, backtest_end)
         if not efts_raw.empty:
             efts_df = _finalize_dates(_normalize_columns(efts_raw, "senate"), "senate")
             # Merge: keep EFTS records for the target window, legacy for everything else
