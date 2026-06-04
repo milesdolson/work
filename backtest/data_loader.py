@@ -158,18 +158,25 @@ def _normalize_columns(df: pd.DataFrame, chamber: str) -> pd.DataFrame:
 
     mapping = {}
     for target, candidates in [
-        ("filing_date",       ["disclosure_date", "filing_date", "filed", "date_received", "disclosure"]),
-        ("transaction_date",  ["transaction_date", "date_transacted", "transactiondate", "date"]),
-        ("ticker",            ["ticker", "stock_ticker", "symbol", "stock"]),
-        ("amount",            ["amount", "trade_size", "value", "range"]),
-        ("transaction_type",  ["type", "transaction_type", "trade_type", "transactiontype"]),
-        ("owner",             ["owner", "filer", "filing_for"]),
+        ("filing_date",       ["disclosure_date", "filing_date", "filed", "date_received",
+                                "disclosure", "notification_date", "submitted_date",
+                                "date_filed", "filing_date_str"]),
+        ("transaction_date",  ["transaction_date", "date_transacted", "transactiondate",
+                                "date_of_transaction", "date"]),
+        ("ticker",            ["ticker", "stock_ticker", "symbol", "stock", "asset_ticker",
+                                "ticker_symbol"]),
+        ("amount",            ["amount", "trade_size", "value", "range", "amount_range",
+                                "amount_low", "amount_range_low"]),
+        ("transaction_type",  ["type", "transaction_type", "trade_type", "transactiontype",
+                                "transaction_type_str"]),
+        ("owner",             ["owner", "filer", "filing_for", "ownership"]),
         ("legislator",        ["representative", "senator", "name", "representative_name",
-                                "senator_name", "fullname", "full_name"]),
+                                "senator_name", "fullname", "full_name", "filer_name",
+                                "member_name", "legislator_name"]),
         ("party",             ["party"]),
-        ("state",             ["state"]),
+        ("state",             ["state", "state_dst", "district"]),
         ("asset_description", ["asset_description", "description", "asset_name",
-                                "company_name", "company", "name_of_security"]),
+                                "company_name", "company", "name_of_security", "asset"]),
     ]:
         for c in candidates:
             if c in cols_lower:
@@ -245,63 +252,241 @@ def _try_sources(urls: list[str], chamber: str, cache_path: Path) -> Optional[pd
 
 
 def _load_senate_efts(start: str = "2023-01-01", end: str = "2024-12-31") -> pd.DataFrame:
-    """Load Senate trades from the EFTS search API (paginated)."""
+    """
+    Load Senate PTR transactions from the official EFTS search API with pagination.
+    Returns raw DataFrame; caller normalizes column names.
+    """
     records = []
-    page = 1
-    while True:
+    max_pages = 200  # cap at 2000 records
+    consecutive_errors = 0
+
+    while len(records) < max_pages * 10:
         try:
             url = (
-                f"https://efts.senate.gov/LATEST/search.json"
+                "https://efts.senate.gov/LATEST/search.json"
                 f"?q=%22stock%22&dateRange=custom&fromDate={start}&toDate={end}"
-                f"&hits.hits._source=true&from={len(records)}"
+                f"&from={len(records)}&size=10"
             )
-            resp = requests.get(url, timeout=20)
+            resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
             resp.raise_for_status()
             data = resp.json()
             hits = data.get("hits", {}).get("hits", [])
             if not hits:
                 break
             for hit in hits:
-                records.append(hit.get("_source", {}))
+                src = hit.get("_source", {})
+                records.append(src)
+            consecutive_errors = 0
             if len(hits) < 10:
+                break  # last page
+        except Exception as exc:
+            consecutive_errors += 1
+            if consecutive_errors >= 3:
+                print(f"  senate EFTS: stopping after {consecutive_errors} errors: {exc}")
                 break
-        except Exception:
-            break
+
     if not records:
         return pd.DataFrame()
-    return pd.DataFrame(records)
+
+    df = pd.DataFrame(records)
+    # Debug: show field names on first call so we can fix normalization if needed
+    print(f"  senate EFTS: {len(df)} raw records; columns: {list(df.columns)[:12]}")
+    return df
+
+
+def _load_house_clerk(start_year: int = 2023, end_year: int = 2024) -> pd.DataFrame:
+    """
+    Download PTR (Periodic Transaction Report) trade data from the official
+    House Clerk financial disclosure bulk ZIP/XML system.
+    Each year's data is at: disclosures-clerk.house.gov/public_disc/financial-pdfs/{YEAR}FD.zip
+    The ZIP contains an XML index; PTR type filings include transaction data in HTML reports.
+    """
+    import zipfile
+    from xml.etree import ElementTree as ET
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        print("  house clerk: beautifulsoup4 not available")
+        return pd.DataFrame()
+
+    all_records = []
+
+    for year in range(start_year, end_year + 1):
+        zip_url = f"https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}FD.zip"
+        print(f"  house clerk: downloading {year} index from {zip_url} ...")
+        try:
+            resp = requests.get(zip_url, timeout=60)
+            resp.raise_for_status()
+        except Exception as exc:
+            print(f"  house clerk: {year} zip failed: {exc}")
+            continue
+
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(resp.content))
+            xml_name = f"{year}FD.xml"
+            with zf.open(xml_name) as fh:
+                tree = ET.parse(fh)
+            root = tree.getroot()
+        except Exception as exc:
+            print(f"  house clerk: {year} XML parse failed: {exc}")
+            continue
+
+        # Find PTR filings (FilingType == "P")
+        ptr_filings = []
+        for filing in root.iter("Filing"):
+            ft = (filing.findtext("FilingType") or "").strip().upper()
+            if ft != "P":
+                continue
+            doc_id = (filing.findtext("DocID") or "").strip()
+            first = (filing.findtext("First") or filing.findtext("FirstName") or "").strip()
+            last = (filing.findtext("Last") or filing.findtext("LastName") or "").strip()
+            filing_date = (filing.findtext("FilingDate") or "").strip()
+            state_dst = (filing.findtext("StateDst") or "").strip()
+            if doc_id:
+                ptr_filings.append({
+                    "doc_id": doc_id,
+                    "year": year,
+                    "legislator": f"{first} {last}".strip(),
+                    "filing_date": filing_date,
+                    "state": state_dst,
+                })
+
+        print(f"  house clerk: {year} has {len(ptr_filings)} PTR filings, fetching transaction details...")
+
+        # Fetch individual PTR HTML reports (rate-limited)
+        for i, ptr in enumerate(ptr_filings):
+            if i % 50 == 0 and i > 0:
+                print(f"    ... {i}/{len(ptr_filings)} PTRs fetched")
+            doc_id = ptr["doc_id"]
+            htm_url = f"https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/{year}/{doc_id}.htm"
+            try:
+                r2 = requests.get(htm_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+                r2.raise_for_status()
+                soup = BeautifulSoup(r2.text, "html.parser")
+            except Exception:
+                continue
+
+            # Parse transaction table rows
+            for table in soup.find_all("table"):
+                headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+                if not any(h in headers for h in ("transaction", "ticker", "asset")):
+                    continue
+                for row in table.find_all("tr")[1:]:
+                    cells = [td.get_text(strip=True) for td in row.find_all("td")]
+                    if len(cells) < 4:
+                        continue
+                    # Map cells to fields by header position when available
+                    rec = {
+                        "legislator": ptr["legislator"],
+                        "filing_date": ptr["filing_date"],
+                        "state": ptr["state"],
+                        "chamber": "house",
+                    }
+                    for j, h in enumerate(headers):
+                        if j < len(cells):
+                            if "ticker" in h:
+                                rec["ticker"] = cells[j]
+                            elif "transaction" in h and "type" in h:
+                                rec["transaction_type"] = cells[j]
+                            elif "date" in h and "transaction" in h:
+                                rec["transaction_date"] = cells[j]
+                            elif "date" in h and "notif" in h:
+                                rec["filing_date"] = cells[j]
+                            elif "amount" in h:
+                                rec["amount"] = cells[j]
+                            elif "owner" in h:
+                                rec["owner"] = cells[j]
+                            elif "asset" in h or "description" in h:
+                                rec["asset_description"] = cells[j]
+                    if rec.get("ticker") or rec.get("asset_description"):
+                        all_records.append(rec)
+            time.sleep(0.1)  # be polite to the server
+
+    if not all_records:
+        return pd.DataFrame()
+    df = pd.DataFrame(all_records)
+    print(f"  house clerk: {len(df)} total transaction records")
+    return df
+
+
+def _finalize_dates(df: pd.DataFrame, chamber: str) -> pd.DataFrame:
+    """Parse and fill dates for a single chamber DataFrame."""
+    df["filing_date"] = df["filing_date"].apply(_parse_date)
+    if "transaction_date" in df.columns:
+        df["transaction_date"] = df["transaction_date"].apply(_parse_date)
+    # When source lacks filing_date, approximate as transaction_date + 30d
+    if df["filing_date"].isna().all() and "transaction_date" in df.columns:
+        df["filing_date"] = df["transaction_date"].apply(
+            lambda d: d + pd.Timedelta(days=30) if pd.notna(d) else None
+        )
+        print(f"  {chamber}: no filing_date in source; using transaction_date + 30d as proxy")
+    return df
+
+
+def _has_window_coverage(df: pd.DataFrame, start: str, end: str) -> bool:
+    """Return True if df has any rows with filing_date in [start, end]."""
+    if df is None or df.empty or "filing_date" not in df.columns:
+        return False
+    s, e = pd.Timestamp(start), pd.Timestamp(end)
+    return df["filing_date"].between(s, e).any()
 
 
 def load_congressional_trades(backtest_start="2023-01-01", backtest_end="2024-12-31") -> pd.DataFrame:
     """
     Load, clean, and return all congressional BUY disclosures in the backtest window.
-    Prints a data quality / provenance report.
+    Primary sources: community CSV/JSON files (fast, cached).
+    Fallbacks: official government APIs when primary sources lack target-window data.
+      - Senate: efts.senate.gov (official Senate eFD Elasticsearch backend)
+      - House:  disclosures-clerk.house.gov (official House Clerk bulk XML + HTML PTRs)
     """
     DATA_DIR.mkdir(exist_ok=True)
     frames = []
+    start_year = int(backtest_start[:4])
+    end_year = int(backtest_end[:4])
 
     print("\n=== Congressional Trade Data Provenance ===")
 
-    for chamber, urls in [("house", HOUSE_URLS), ("senate", SENATE_URLS)]:
-        cache_path = DATA_DIR / f"{chamber}_raw.csv"
-        df = _try_sources(urls, chamber, cache_path)
-        if df is None:
-            print(f"  WARNING: could not load {chamber} data from any source")
-            continue
-        df = _normalize_columns(df, chamber)
-        # Parse filing and transaction dates up front so fallback works.
-        df["filing_date"] = df["filing_date"].apply(_parse_date)
-        if "transaction_date" in df.columns:
-            df["transaction_date"] = df["transaction_date"].apply(_parse_date)
-        # If source has no filing_date (e.g. senate-stock-watcher only has
-        # transaction_date), use transaction_date + 30 days as a proxy to
-        # approximate the STOCK Act disclosure lag.
-        if df["filing_date"].isna().all() and "transaction_date" in df.columns:
-            df["filing_date"] = df["transaction_date"].apply(
-                lambda d: d + pd.Timedelta(days=30) if pd.notna(d) else None
-            )
-            print(f"  {chamber}: filing_date not in source; using transaction_date + 30d as proxy")
-        frames.append(df)
+    # ---- Senate ----
+    senate_df = None
+    senate_cache = DATA_DIR / "senate_raw.csv"
+    raw = _try_sources(SENATE_URLS, "senate", senate_cache)
+    if raw is not None:
+        senate_df = _finalize_dates(_normalize_columns(raw, "senate"), "senate")
+    if not _has_window_coverage(senate_df, backtest_start, backtest_end):
+        print(f"  senate: cached data has no {backtest_start[:4]}-{backtest_end[:4]} records; "
+              f"trying official efts.senate.gov ...")
+        efts_raw = _load_senate_efts(backtest_start, backtest_end)
+        if not efts_raw.empty:
+            efts_df = _finalize_dates(_normalize_columns(efts_raw, "senate"), "senate")
+            # Merge: keep EFTS records for the target window, legacy for everything else
+            if senate_df is not None and not senate_df.empty:
+                senate_df = pd.concat([senate_df, efts_df], ignore_index=True).drop_duplicates()
+            else:
+                senate_df = efts_df
+            # Cache EFTS result so next run is fast
+            senate_df.to_csv(senate_cache, index=False)
+    if senate_df is not None and not senate_df.empty:
+        frames.append(senate_df)
+    else:
+        print("  WARNING: could not load senate data from any source")
+
+    # ---- House ----
+    house_df = None
+    house_cache = DATA_DIR / "house_raw.csv"
+    raw = _try_sources(HOUSE_URLS, "house", house_cache)
+    if raw is not None:
+        house_df = _finalize_dates(_normalize_columns(raw, "house"), "house")
+    if not _has_window_coverage(house_df, backtest_start, backtest_end):
+        print(f"  house: cached data has no {backtest_start[:4]}-{backtest_end[:4]} records; "
+              f"trying official disclosures-clerk.house.gov ...")
+        hc_raw = _load_house_clerk(start_year, end_year)
+        if not hc_raw.empty:
+            house_df = _finalize_dates(hc_raw, "house")
+            house_df.to_csv(house_cache, index=False)
+    if house_df is not None and not house_df.empty:
+        frames.append(house_df)
+    else:
+        print("  WARNING: could not load house data from any source")
 
     if not frames:
         raise RuntimeError("No congressional trade data available from any source.")
@@ -309,24 +494,16 @@ def load_congressional_trades(backtest_start="2023-01-01", backtest_end="2024-12
     combined = pd.concat(frames, ignore_index=True)
     raw_count = len(combined)
 
-    # Parse dates and tickers
+    # Parse dates and tickers (second pass handles any un-parsed strings)
     combined["filing_date"] = combined["filing_date"].apply(_parse_date)
     combined["ticker"] = combined["ticker"].apply(_clean_ticker)
 
-    after_parse = len(combined)
-    print(f"  DEBUG after_parse: {after_parse}, filing_date sample: {combined['filing_date'].dropna().head(3).tolist()}")
-    print(f"  DEBUG transaction_type values: {combined['transaction_type'].value_counts().head(5).to_dict()}")
-    print(f"  DEBUG ticker nulls: {combined['ticker'].isna().sum()} / {len(combined)}")
-    print(f"  DEBUG filing_date nulls: {combined['filing_date'].isna().sum()} / {len(combined)}")
-
     # Filter: buys only, valid ticker, valid date
     combined = combined.dropna(subset=["filing_date", "ticker"])
-    print(f"  DEBUG after dropna: {len(combined)}")
     buy_mask = combined["transaction_type"].fillna("").str.lower().str.contains(
         "purchase|buy|bought", na=False
     )
     combined = combined[buy_mask]
-    print(f"  DEBUG after buy_mask: {len(combined)}")
 
     # Restrict to backtest window
     combined = combined[
@@ -336,11 +513,14 @@ def load_congressional_trades(backtest_start="2023-01-01", backtest_end="2024-12
     combined = combined.sort_values("filing_date").reset_index(drop=True)
 
     print(f"\n  Raw records (all types): {raw_count}")
-    print(f"  Buy disclosures in {backtest_start} to {backtest_end}: {len(combined)}")
-    print(f"  Date range: {combined['filing_date'].min().date()} to {combined['filing_date'].max().date()}")
-    print(f"  Unique legislators: {combined['legislator'].nunique()}")
-    print(f"  Unique tickers: {combined['ticker'].nunique()}")
-    print(f"  House: {(combined['chamber']=='house').sum()} | Senate: {(combined['chamber']=='senate').sum()}")
+    if len(combined) > 0:
+        print(f"  Buy disclosures in {backtest_start} to {backtest_end}: {len(combined)}")
+        print(f"  Date range: {combined['filing_date'].min().date()} to {combined['filing_date'].max().date()}")
+        print(f"  Unique legislators: {combined['legislator'].nunique()}")
+        print(f"  Unique tickers: {combined['ticker'].nunique()}")
+        print(f"  House: {(combined['chamber']=='house').sum()} | Senate: {(combined['chamber']=='senate').sum()}")
+    else:
+        print(f"  Buy disclosures in {backtest_start} to {backtest_end}: 0")
 
     if len(combined) == 0:
         raise RuntimeError("No qualifying trades after filtering.")
