@@ -13,6 +13,7 @@ import sys
 import warnings
 from datetime import timedelta
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -31,10 +32,36 @@ END = pd.Timestamp("2024-12-31")
 PRICE_START = START - timedelta(days=40)   # for 30-day momentum lookback
 PRICE_END = END + timedelta(days=100)      # for 90-day exit prices
 INITIAL_VALUE = 100_000.0
-HOLD_DAYS = 90
-MIN_SCORE = 50
-MAX_POSITIONS = 5
 RISK_FREE_RATE = 0.05  # annual
+
+# ---------------------------------------------------------------------------
+# Strategy configuration — edit these to tune the default run
+# ---------------------------------------------------------------------------
+HOLD_DAYS = 90       # calendar days to hold each position
+MIN_SCORE = 50       # minimum composite score to enter a position (default run)
+MAX_POSITIONS = 5    # max concurrent open positions
+
+# Component weights: weighted_score = w1*C1 + w2*C2 + w3*C3 + w4*C4 + w5*C5
+# C1 = Congressional Signal (0-25), C2 = Related Persons (0-15),
+# C3 = Fundamentals (0-25),         C4 = Catalyst (0-20), C5 = Momentum (0-15)
+WEIGHTS = {"c1": 1.0, "c2": 1.0, "c3": 1.0, "c4": 1.0, "c5": 1.0}
+
+# ---------------------------------------------------------------------------
+# Optimization grid (used by --optimize flag)
+# ---------------------------------------------------------------------------
+WEIGHT_PRESETS: dict[str, dict[str, float]] = {
+    "equal":             {"c1": 1.0, "c2": 1.0, "c3": 1.0, "c4": 1.0, "c5": 1.0},
+    "no_c1":             {"c1": 0.0, "c2": 1.0, "c3": 1.0, "c4": 1.0, "c5": 1.0},
+    "boost_c3c5":        {"c1": 1.0, "c2": 1.0, "c3": 2.0, "c4": 1.0, "c5": 2.0},
+    "no_c1_boost_c3c5":  {"c1": 0.0, "c2": 1.0, "c3": 2.0, "c4": 0.5, "c5": 2.0},
+    "c3c5_only":         {"c1": 0.0, "c2": 0.0, "c3": 1.0, "c4": 0.0, "c5": 1.0},
+    "momentum_only":     {"c1": 0.0, "c2": 0.0, "c3": 0.0, "c4": 0.0, "c5": 1.0},
+    "fundamentals_only": {"c1": 0.0, "c2": 0.0, "c3": 1.0, "c4": 0.0, "c5": 0.0},
+}
+OPT_HOLD_DAYS     = [30, 45, 60, 90]
+OPT_MAX_POSITIONS = [3, 5, 8, 10]
+# Qualifying threshold expressed as score quantile (0.90 = top 10% of trades)
+OPT_QUAL_QUANTILE = [0.75, 0.80, 0.85, 0.90]
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +86,19 @@ def compute_cluster_counts(trades_df: pd.DataFrame) -> dict[int, int]:
             window = (dates >= d - timedelta(days=30)) & (dates <= d + timedelta(days=30))
             counts[idx] = int(window.sum()) - 1  # exclude self
     return counts
+
+
+def apply_weights(scored_df: pd.DataFrame, weights: dict) -> pd.DataFrame:
+    """Recompute composite score from raw component columns using provided weights."""
+    df = scored_df.copy()
+    df["score"] = (
+        weights["c1"] * df["score_c1_signal"]
+        + weights["c2"] * df["score_c2_related"]
+        + weights["c3"] * df["score_c3_fundamentals"]
+        + weights["c4"] * df["score_c4_catalyst"]
+        + weights["c5"] * df["score_c5_news"]
+    )
+    return df
 
 
 def run_scoring_pipeline(
@@ -142,20 +182,30 @@ def run_scoring_pipeline(
 def run_backtest(
     scored_df: pd.DataFrame,
     price_cache: dict,
-    missing_tickers: list,
+    missing_tickers: Optional[list] = None,
+    *,
+    hold_days: Optional[int] = None,
+    min_score: Optional[float] = None,
+    max_positions: Optional[int] = None,
+    verbose: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Weekly-rebalanced long-only backtest.
 
     Entry: open price the day AFTER filing_date.
-    Exit: open price 90 calendar days after entry.
-    Portfolio: top 5 qualifying signals per week, equal weight.
+    Exit: open price hold_days calendar days after entry.
+    Portfolio: top max_positions qualifying signals per week, equal weight.
 
     Returns (portfolio_history_df, closed_positions_df).
     """
-    qualifying = scored_df[scored_df["score"] >= MIN_SCORE].copy()
+    _hold = hold_days if hold_days is not None else HOLD_DAYS
+    _min  = min_score if min_score is not None else MIN_SCORE
+    _max  = max_positions if max_positions is not None else MAX_POSITIONS
+
+    qualifying = scored_df[scored_df["score"] >= _min].copy()
     qualifying = qualifying.sort_values("filing_date").reset_index(drop=True)
-    print(f"\n  Simulating {len(qualifying)} qualifying trades...")
+    if verbose:
+        print(f"\n  Simulating {len(qualifying)} qualifying trades...")
 
     cash = INITIAL_VALUE
     open_positions: list[dict] = []
@@ -195,7 +245,7 @@ def run_backtest(
         portfolio_history.append({"date": week_start, "value": total_value})
 
         # 3. Fill vacant slots with new trades
-        slots = MAX_POSITIONS - len(open_positions)
+        slots = _max - len(open_positions)
         if slots <= 0:
             continue
 
@@ -214,8 +264,7 @@ def run_backtest(
             if entry_price is None or entry_price <= 0:
                 continue
 
-            # Equal weight: 1/5 of current portfolio value
-            position_size = min(total_value / MAX_POSITIONS, cash)
+            position_size = min(total_value / _max, cash)
             if position_size <= 0:
                 continue
 
@@ -224,7 +273,7 @@ def run_backtest(
                 **trade.to_dict(),
                 "entry_date": entry_date,
                 "entry_price": entry_price,
-                "exit_date": entry_date + timedelta(days=HOLD_DAYS),
+                "exit_date": entry_date + timedelta(days=_hold),
                 "position_value": position_size,
                 "shares": position_size / entry_price,
             })
@@ -245,7 +294,8 @@ def run_backtest(
 
     ph = pd.DataFrame(portfolio_history)
     cp = pd.DataFrame(closed_positions) if closed_positions else pd.DataFrame()
-    print(f"  Simulation complete: {len(closed_positions)} positions closed")
+    if verbose:
+        print(f"  Simulation complete: {len(closed_positions)} positions closed")
     return ph, cp
 
 
@@ -410,17 +460,127 @@ def chart_score_scatter(closed: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
+# Grid search optimizer
+# ---------------------------------------------------------------------------
+
+def run_optimization(
+    scored_df: pd.DataFrame,
+    price_cache: dict,
+    bench_voo: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Grid search over weight presets, hold periods, max positions, and qualifying thresholds.
+    Reuses already-computed per-trade component scores — no re-fetching needed.
+    Qualifying threshold is expressed as a score quantile so it scales across weight presets.
+    """
+    voo_total_ret = (bench_voo["value"].iloc[-1] / bench_voo["value"].iloc[0]) - 1
+
+    combos = [
+        (preset, hd, mp, qq)
+        for preset in WEIGHT_PRESETS
+        for hd in OPT_HOLD_DAYS
+        for mp in OPT_MAX_POSITIONS
+        for qq in OPT_QUAL_QUANTILE
+    ]
+    total = len(combos)
+    print(f"\n[OPT] Grid searching {total} parameter combinations "
+          f"({len(WEIGHT_PRESETS)} weight presets × {len(OPT_HOLD_DAYS)} hold periods × "
+          f"{len(OPT_MAX_POSITIONS)} position limits × {len(OPT_QUAL_QUANTILE)} thresholds)...")
+
+    results = []
+    for i, (preset, hd, mp, qq) in enumerate(combos):
+        weights = WEIGHT_PRESETS[preset]
+        df = apply_weights(scored_df, weights)
+        thresh = float(df["score"].quantile(qq))
+        n_qual = int((df["score"] >= thresh).sum())
+
+        row: dict = {
+            "weights": preset,
+            "hold_days": hd,
+            "max_positions": mp,
+            "qual_pct": f"top {(1 - qq) * 100:.0f}%",
+            "n_qualifying": n_qual,
+            "total_return_pct": float("nan"),
+            "alpha_pp": float("nan"),
+            "sharpe_ratio": float("nan"),
+            "n_positions": 0,
+        }
+
+        if n_qual >= 3:
+            try:
+                ph, cp = run_backtest(
+                    df, price_cache,
+                    hold_days=hd, min_score=thresh, max_positions=mp,
+                    verbose=False,
+                )
+                vals = ph["value"].values.astype(float)
+                total_ret = (vals[-1] - vals[0]) / vals[0]
+                weekly_ret = np.diff(vals) / vals[:-1]
+                rf_weekly = (1 + RISK_FREE_RATE) ** (1 / 52) - 1
+                excess = weekly_ret - rf_weekly
+                vol = np.std(excess)
+                sharpe = (np.mean(excess) / vol * np.sqrt(52)) if vol > 0 else 0.0
+                row.update({
+                    "total_return_pct": round(total_ret * 100, 2),
+                    "alpha_pp": round((total_ret - voo_total_ret) * 100, 2),
+                    "sharpe_ratio": round(sharpe, 3),
+                    "n_positions": len(cp),
+                })
+            except Exception:
+                pass
+
+        results.append(row)
+
+        if (i + 1) % 20 == 0 or (i + 1) == total:
+            print(f"  Progress: {i + 1}/{total}", end="\r", flush=True)
+
+    print()
+
+    res_df = pd.DataFrame(results)
+    valid = res_df.dropna(subset=["total_return_pct"])
+    cols = ["weights", "hold_days", "max_positions", "qual_pct", "n_qualifying",
+            "total_return_pct", "alpha_pp", "sharpe_ratio", "n_positions"]
+
+    ranked_ret = valid.sort_values("total_return_pct", ascending=False)
+    print(f"\n{'=' * 95}")
+    print("OPTIMIZATION — Top 20 by Total Return")
+    print(f"{'=' * 95}")
+    print(ranked_ret[cols].head(20).to_string(index=False))
+
+    ranked_sharpe = valid.sort_values("sharpe_ratio", ascending=False)
+    print(f"\n{'=' * 95}")
+    print("OPTIMIZATION — Top 10 by Sharpe Ratio")
+    print(f"{'=' * 95}")
+    print(ranked_sharpe[cols].head(10).to_string(index=False))
+
+    out_path = RESULTS_DIR / "optimization.csv"
+    res_df.sort_values("total_return_pct", ascending=False, na_position="last").to_csv(
+        out_path, index=False
+    )
+    print(f"\n  Full results ({len(res_df)} rows) -> {out_path}")
+    return res_df
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     RESULTS_DIR.mkdir(exist_ok=True)
     missing_tickers: list[str] = []
+    optimize_mode = "--optimize" in sys.argv
 
     print("=" * 60)
     print("Congressional Signal Investment Backtest")
     print(f"Period: {START.date()} to {END.date()}")
-    print(f"Strategy: top-{MAX_POSITIONS} weekly, 90-day hold, score >= {MIN_SCORE}")
+    if optimize_mode:
+        print(f"Mode: GRID SEARCH OPTIMIZATION ({len(WEIGHT_PRESETS)} weight presets, "
+              f"{len(OPT_HOLD_DAYS)*len(OPT_MAX_POSITIONS)*len(OPT_QUAL_QUANTILE)} "
+              f"param combos each)")
+    else:
+        print(f"Strategy: top-{MAX_POSITIONS} weekly, {HOLD_DAYS}-day hold, score >= {MIN_SCORE}")
+        print(f"Weights:  C1={WEIGHTS['c1']} C2={WEIGHTS['c2']} C3={WEIGHTS['c3']} "
+              f"C4={WEIGHTS['c4']} C5={WEIGHTS['c5']}")
     print("=" * 60)
 
     # Init DB
@@ -445,15 +605,21 @@ def main() -> None:
     # Step 4: Score
     print("\n[4/7] Scoring trades...")
     scored_df = run_scoring_pipeline(trades_df, conn, price_cache, committee_map, missing_tickers)
+    scored_df = apply_weights(scored_df, WEIGHTS)
 
-    # Step 5: Run backtest
-    print("\n[5/7] Running backtest simulation...")
-    ph, closed = run_backtest(scored_df, price_cache, missing_tickers)
-
-    # Step 6: Benchmarks
-    print("\n[6/7] Building benchmark curves...")
+    # Step 5: Benchmarks (needed for both modes)
+    print("\n[5/7] Building benchmark curves...")
     bench_voo = build_benchmark("VOO", price_cache, alloc=1.0)
     bench_vxus = build_benchmark("VXUS", price_cache, alloc=1.0)
+
+    # Optimization mode: grid search and exit early
+    if optimize_mode:
+        run_optimization(scored_df, price_cache, bench_voo)
+        return
+
+    # Step 6: Run backtest (default mode only)
+    print("\n[6/7] Running backtest simulation...")
+    ph, closed = run_backtest(scored_df, price_cache, missing_tickers)
 
     # 60/40 mixed: combine weekly values
     voo_series = bench_voo.set_index("date")["value"]
