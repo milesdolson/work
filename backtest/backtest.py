@@ -122,6 +122,11 @@ def run_scoring_pipeline(
         )
         scored_records.append(scored)
 
+    if not scored_records:
+        raise RuntimeError(
+            "No trades could be scored — price data unavailable for all tickers. "
+            "Check yfinance connectivity."
+        )
     result = pd.DataFrame(scored_records)
     result = result.sort_values("filing_date").reset_index(drop=True)
 

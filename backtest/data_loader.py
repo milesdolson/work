@@ -764,36 +764,36 @@ def batch_fetch_prices(
             if raw.empty:
                 continue
 
-            # Single ticker: flat columns; multi-ticker: (metric, ticker) multi-index
-            if len(chunk) == 1:
-                t = chunk[0]
-                if "Open" in raw.columns and "Close" in raw.columns:
-                    df = raw[["Open", "Close"]].copy()
+            for t in chunk:
+                try:
+                    # Handle both flat columns (single ticker) and MultiIndex layouts:
+                    #   group_by="ticker" → (ticker, metric) — level 0 = ticker
+                    #   group_by="column" / older yfinance → (metric, ticker) — level 0 = metric
+                    if isinstance(raw.columns, pd.MultiIndex):
+                        lvl0 = set(raw.columns.get_level_values(0))
+                        if t in lvl0:
+                            df_t = raw[t]                     # (ticker, metric) layout
+                        elif "Open" in lvl0:
+                            df_t = pd.DataFrame(              # (metric, ticker) layout
+                                {"Open": raw["Open"].get(t), "Close": raw["Close"].get(t)},
+                                index=raw.index,
+                            )
+                        else:
+                            continue
+                    else:
+                        df_t = raw  # flat columns — single-ticker download
+
+                    if "Open" not in df_t.columns or "Close" not in df_t.columns:
+                        continue
+                    df = df_t[["Open", "Close"]].copy()
                     df.columns = ["open", "close"]
                     df.index = df.index.tz_localize(None)
                     df = df.dropna()
-                    _cache_price_df(t, df, conn)
-                    price_cache[t] = df
-            else:
-                for t in chunk:
-                    try:
-                        if ("Open", t) in raw.columns and ("Close", t) in raw.columns:
-                            df = raw[["Open", "Close"]].xs(t, axis=1, level=1)
-                        elif "Open" in raw.columns.get_level_values(0):
-                            df = pd.DataFrame({
-                                "open": raw["Open"][t],
-                                "close": raw["Close"][t],
-                            })
-                        else:
-                            continue
-                        df.columns = ["open", "close"]
-                        df.index = df.index.tz_localize(None)
-                        df = df.dropna()
-                        if not df.empty:
-                            _cache_price_df(t, df, conn)
-                            price_cache[t] = df
-                    except Exception:
-                        continue
+                    if not df.empty:
+                        _cache_price_df(t, df, conn)
+                        price_cache[t] = df
+                except Exception:
+                    continue
         except Exception as e:
             # Fallback: individual fetches for this chunk
             for t in chunk:
