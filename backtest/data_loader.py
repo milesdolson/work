@@ -134,20 +134,16 @@ def _parse_date(val) -> Optional[pd.Timestamp]:
 
 
 def _extract_ticker_from_description(desc) -> Optional[str]:
-    """Pull a ticker symbol out of an asset description string.
-    Handles 'NVIDIA Corp (NVDA)' style and plain 'NVDA' prefixes.
+    """Pull a ticker symbol from an asset description string.
+    Only uses the parenthetical form 'Company Name (TICK)' which is
+    reliable for electronic House PTR filings.  The word-boundary
+    fallback was removed because it produced false positives from
+    English words like BANK, STOCK, FIRST, etc.
     """
     if not isinstance(desc, str):
         return None
     m = re.search(r'\(([A-Z]{1,5})\)', desc)
-    if m:
-        return m.group(1)
-    # Fall back: first all-caps 2–5 char token
-    for token in desc.split():
-        t = re.sub(r'[^A-Z]', '', token.upper())
-        if 2 <= len(t) <= 5 and token.upper() == t:
-            return t
-    return None
+    return m.group(1) if m else None
 
 
 def _clean_ticker(val) -> Optional[str]:
