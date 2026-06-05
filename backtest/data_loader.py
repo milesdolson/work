@@ -133,6 +133,23 @@ def _parse_date(val) -> Optional[pd.Timestamp]:
         return None
 
 
+def _extract_ticker_from_description(desc) -> Optional[str]:
+    """Pull a ticker symbol out of an asset description string.
+    Handles 'NVIDIA Corp (NVDA)' style and plain 'NVDA' prefixes.
+    """
+    if not isinstance(desc, str):
+        return None
+    m = re.search(r'\(([A-Z]{1,5})\)', desc)
+    if m:
+        return m.group(1)
+    # Fall back: first all-caps 2–5 char token
+    for token in desc.split():
+        t = re.sub(r'[^A-Z]', '', token.upper())
+        if 2 <= len(t) <= 5 and token.upper() == t:
+            return t
+    return None
+
+
 def _clean_ticker(val) -> Optional[str]:
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return None
@@ -676,12 +693,25 @@ def load_congressional_trades(backtest_start="2023-01-01", backtest_end="2024-12
 
     # Parse dates and tickers (second pass handles any un-parsed strings)
     combined["filing_date"] = combined["filing_date"].apply(_parse_date)
+
+    # For House records the ticker is often embedded in asset_description
+    # (e.g. "NVIDIA Corp (NVDA)") rather than in its own column.
+    if "ticker" not in combined.columns:
+        combined["ticker"] = None
+    no_ticker = combined["ticker"].isna()
+    if no_ticker.any() and "asset_description" in combined.columns:
+        combined.loc[no_ticker, "ticker"] = (
+            combined.loc[no_ticker, "asset_description"]
+            .apply(_extract_ticker_from_description)
+        )
+
     combined["ticker"] = combined["ticker"].apply(_clean_ticker)
 
     # Filter: buys only, valid ticker, valid date
     combined = combined.dropna(subset=["filing_date", "ticker"])
+    # House uses single-letter codes ("P" = Purchase); Senate uses full words.
     buy_mask = combined["transaction_type"].fillna("").str.lower().str.contains(
-        "purchase|buy|bought", na=False
+        r"purchase|buy|bought|\bp\b", na=False, regex=True
     )
     combined = combined[buy_mask]
 
